@@ -122,7 +122,8 @@ test("commits behind", async () => {
   await changeBase("p2");
   await atlantis.plan(pr);
   expect(await atlantis.apply(pr)).toContain(blockedBy("maximum_commits_behind"));
-  await behind.update(1);
+  await pr.update();
+  await atlantis.plan(pr);
   expect(await atlantis.apply(pr)).toContain(applied);
 });
 

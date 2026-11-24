@@ -66,10 +66,7 @@ export async function changeBase(project: string) {
 export async function restrict(kind: string, value?: number) {
   const body = { kind, value, branch_match_kind: "glob", pattern: base, users: [], groups: [] };
   const { id } = await api("POST", `${repo}/branch-restrictions`, body, "admin");
-  return {
-    update: (value: number) => api("PUT", `${repo}/branch-restrictions/${id}`, { ...body, value }, "admin"),
-    [Symbol.asyncDispose]: () => api("DELETE", `${repo}/branch-restrictions/${id}`, undefined, "admin"),
-  };
+  return { [Symbol.asyncDispose]: () => api("DELETE", `${repo}/branch-restrictions/${id}`, undefined, "admin") };
 }
 
 export async function setup() {
@@ -94,18 +91,27 @@ export async function teardown() {
   }
 }
 
+const createPR = (source: string, destination: string, draft = false) =>
+  api("POST", `${repo}/pullrequests`, {
+    title: source, draft, source: { branch: { name: source } }, destination: { branch: { name: destination } },
+  });
+
 export async function openPR(projects: string[], { draft = false } = {}) {
   const branch = `${base}-${crypto.randomUUID().slice(0, 8)}`;
   await commit(branch, await change(projects), await head(base));
-  const { id, source } = await api("POST", `${repo}/pullrequests`, {
-    title: branch, draft, source: { branch: { name: branch } }, destination: { branch: { name: base } },
-  });
+  const { id, source } = await createPR(branch, base, draft);
   const path = `${repo}/pullrequests/${id}`;
 
   return {
     path,
     requestChanges: () => api("POST", `${path}/request-changes`),
     clearChanges: () => api("DELETE", `${path}/request-changes`),
+    /** Merges the base branch into it. There is no API for that, other than with another pull request. */
+    async update() {
+      const { id } = await createPR(base, branch);
+      await api("POST", `${repo}/pullrequests/${id}/merge`, { close_source_branch: false });
+      await Bun.sleep(5000);
+    },
     build: (key: string, state: "FAILED" | "INPROGRESS" | "SUCCESSFUL") =>
       api("POST", `${repo}/commit/${source.commit.hash}/statuses/build`, { key, state, url: "https://example.com" }),
     async comments() {
