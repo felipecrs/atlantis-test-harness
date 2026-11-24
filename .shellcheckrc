@@ -1,0 +1,2 @@
+# The VCS files are only known at runtime.
+disable=SC1090,SC1091,SC2034,SC2154
