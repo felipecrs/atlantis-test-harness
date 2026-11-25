@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { $ } from "bun";
 
-const url = `http://localhost:${process.env.PORT ?? 4141}`;
+export const url = `http://localhost:${process.env.PORT ?? 4141}`;
 const work = mkdtempSync(join(tmpdir(), "atlantis-"));
 process.on("exit", () => rmSync(work, { recursive: true, force: true }));
 
@@ -14,12 +14,12 @@ export const failApply = Bun.file(join(work, "fail-apply"));
 
 export interface PullRequest {
   comments(): Promise<{ id: number; text: string }[]>;
-  /** The webhook for a comment, or for when the pull request is opened. */
-  webhook(comment?: string): Promise<{ headers: Record<string, string>; body: string }>;
+  /** Makes the VCS, or something on its behalf, send the webhook for the command. */
+  send(command: string): Promise<unknown>;
 }
 
-async function waitFor(what: string, condition: () => Promise<boolean>) {
-  for (let i = 0; i < 120; i++) {
+export async function waitFor(what: string, condition: () => Promise<boolean>) {
+  for (let i = 0; i < 360; i++) {
     if (await condition()) return;
     await Bun.sleep(500);
   }
@@ -60,11 +60,9 @@ export async function startAtlantis(env: Record<string, string>, flags: string[]
   }
 
   /** Returns what Atlantis replied. */
-  async function run(pr: PullRequest, comment?: string) {
+  async function run(pr: PullRequest, command: string) {
     const seen = new Set((await pr.comments()).map((c) => c.id));
-    await Bun.sleep(5000); // to not hit rate limits
-    const response = await fetch(`${url}/events`, { method: "POST", ...(await pr.webhook(comment)) });
-    if (!response.ok) throw new Error(await response.text());
+    await pr.send(command);
     await Bun.sleep(3000); // it's handled in the background
     await waitFor("the command", async () => {
       const status = (await (await fetch(`${url}/status`)).json()) as { in_progress_operations: number };
@@ -74,7 +72,7 @@ export async function startAtlantis(env: Record<string, string>, flags: string[]
   }
 
   return {
-    plan: (pr: PullRequest) => run(pr),
+    plan: (pr: PullRequest) => run(pr, "atlantis plan"),
     apply: (pr: PullRequest, project?: string) => run(pr, `atlantis apply${project ? ` -p ${project}` : ""}`),
     [Symbol.asyncDispose]: stop,
   };

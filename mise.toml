@@ -1,6 +1,7 @@
 [tools]
 bun = "1"
+cloudflared = "2026"
 terraform = "1.11.4"
 
 [tasks.test]
-run = "bun test"
+run = ["bun install --frozen-lockfile", "bun test"]

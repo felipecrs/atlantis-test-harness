@@ -1,6 +1,6 @@
 // Bitbucket Cloud. Everything is done against its own base branch, so that it
 // doesn't touch the main one nor its restrictions.
-import { secret, startAtlantis, type PullRequest } from "./atlantis";
+import { secret, startAtlantis, url, type PullRequest } from "./atlantis";
 
 const { BB_REPO, BB_EMAIL, BB_TOKEN, BB_ADMIN_TOKEN, BB2_EMAIL, BB2_TOKEN } = process.env;
 const accounts = {
@@ -48,7 +48,7 @@ const head = async (branch: string): Promise<string> => (await api("GET", `${rep
 
 async function commit(branch: string, files: Record<string, string>, parent: string) {
   const form = new FormData();
-  for (const [name, value] of Object.entries({ ...files, branch, parents: parent, message: "Change" })) form.append(name, value);
+  for (const [name, value] of Object.entries({ ...files, branch, parents: parent, message: "Change [skip ci]" })) form.append(name, value);
   await api("POST", `${repo}/src`, form);
 }
 
@@ -75,16 +75,37 @@ export async function setup() {
   await commit(base, { "atlantis.yaml": yaml, ...(await change(["p1", "p2"])) }, await head(mainbranch.name));
   await restrict("require_no_changes_requested");
   await restrict("require_tasks_to_be_completed");
-  await restrict("require_passing_builds_to_merge", 1);
+  await requireBuilds(1);
+}
+
+/** There can be only one per branch, so it needs to be set back to 1. */
+let buildsRestriction: number | undefined;
+export async function requireBuilds(value: number) {
+  const body = { kind: "require_passing_builds_to_merge", value, branch_match_kind: "glob", pattern: base, users: [], groups: [] };
+  const path = `${repo}/branch-restrictions`;
+  ({ id: buildsRestriction } = buildsRestriction
+    ? await api("PUT", `${path}/${buildsRestriction}`, body, "admin")
+    : await api("POST", path, body, "admin"));
+}
+
+/** Delivers the events for real. */
+export async function createWebhook(url: string) {
+  const { uuid } = await api("POST", `${repo}/hooks`, {
+    description: "harness", url, secret, active: true, events: ["pullrequest:created", "pullrequest:comment_created"],
+  }, "admin");
+  return { [Symbol.asyncDispose]: () => api("DELETE", `${repo}/hooks/${encodeURIComponent(uuid)}`, undefined, "admin") };
 }
 
 /** Also removes what was left from runs that were killed. */
 export async function teardown() {
   for (const pr of (await api("GET", `${repo}/pullrequests?state=OPEN&pagelen=50`)).values) {
-    if (pr.destination.branch.name.startsWith(prefix)) await api("POST", `${repo}/pullrequests/${pr.id}/decline`).catch(() => {});
+    if (pr.source.branch.name.startsWith(prefix)) await api("POST", `${repo}/pullrequests/${pr.id}/decline`).catch(() => {});
   }
   for (const r of (await api("GET", `${repo}/branch-restrictions?pagelen=100`, undefined, "admin")).values) {
     if (r.pattern.startsWith(prefix)) await api("DELETE", `${repo}/branch-restrictions/${r.id}`, undefined, "admin");
+  }
+  for (const h of (await api("GET", `${repo}/hooks?pagelen=100`, undefined, "admin")).values) {
+    if (h.description === "harness") await api("DELETE", `${repo}/hooks/${encodeURIComponent(h.uuid)}`, undefined, "admin");
   }
   for (const b of (await api("GET", `${repo}/refs/branches?pagelen=100&q=name~"${prefix}"`)).values) {
     await api("DELETE", `${repo}/refs/branches/${b.name}`);
@@ -96,20 +117,22 @@ const createPR = (source: string, destination: string, draft = false) =>
     title: source, draft, source: { branch: { name: source } }, destination: { branch: { name: destination } },
   });
 
-export async function openPR(projects: string[], { draft = false } = {}) {
+export async function openPR(projects: string[], { draft = false, destination = base } = {}) {
   const branch = `${base}-${crypto.randomUUID().slice(0, 8)}`;
-  await commit(branch, await change(projects), await head(base));
-  const { id, source } = await createPR(branch, base, draft);
+  await commit(branch, await change(projects), await head(destination));
+  const { id, source } = await createPR(branch, destination, draft);
   const path = `${repo}/pullrequests/${id}`;
 
   return {
     path,
+    comment: (raw: string, as: Account) => api("POST", `${path}/comments`, { content: { raw } }, as),
+    state: async () => (await api("GET", path)).state as string,
     requestChanges: () => api("POST", `${path}/request-changes`),
     clearChanges: () => api("DELETE", `${path}/request-changes`),
     /** Merges the base branch into it. There is no API for that, other than with another pull request. */
     async update() {
       const { id } = await createPR(base, branch);
-      await api("POST", `${repo}/pullrequests/${id}/merge`, { close_source_branch: false });
+      await api("POST", `${repo}/pullrequests/${id}/merge`, { close_source_branch: false, message: "Merge [skip ci]" });
       await Bun.sleep(5000);
     },
     build: (key: string, state: "FAILED" | "INPROGRESS" | "SUCCESSFUL") =>
@@ -118,21 +141,25 @@ export async function openPR(projects: string[], { draft = false } = {}) {
       const { values } = await api("GET", `${path}/comments?pagelen=100`);
       return values.filter((c: any) => !c.deleted).map((c: any) => ({ id: c.id, text: c.content.raw }));
     },
-    // Without the uuid of the actor, otherwise Atlantis would ignore its own comments.
-    async webhook(comment?: string) {
+    // Replayed, without the uuid of the actor. Otherwise Atlantis would ignore its own comments.
+    // Plans are sent as if the pull request was just opened.
+    async send(command: string) {
+      await Bun.sleep(5000); // to not hit rate limits
       const pullrequest = await api("GET", path);
       const body = JSON.stringify({
         actor: { account_id: "harness" }, repository: pullrequest.destination.repository, pullrequest,
-        comment: { content: { raw: comment ?? "" } },
+        comment: { content: { raw: command } },
       });
-      return {
+      const response = await fetch(`${url}/events`, {
+        method: "POST",
         headers: {
-          "X-Event-Key": comment ? "pullrequest:comment_created" : "pullrequest:created",
+          "X-Event-Key": command === "atlantis plan" ? "pullrequest:created" : "pullrequest:comment_created",
           "X-Request-UUID": "harness",
           "X-Hub-Signature": `sha256=${new Bun.CryptoHasher("sha256", secret).update(body).digest("hex")}`,
         },
         body,
-      };
+      });
+      if (!response.ok) throw new Error(await response.text());
     },
   } satisfies PullRequest & Record<string, unknown>;
 }
