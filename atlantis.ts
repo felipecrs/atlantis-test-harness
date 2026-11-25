@@ -9,6 +9,8 @@ const work = mkdtempSync(join(tmpdir(), "atlantis-"));
 process.on("exit", () => rmSync(work, { recursive: true, force: true }));
 
 export const secret = crypto.randomUUID();
+/** What Atlantis replies when it applies. */
+export const applied = "Apply complete!";
 /** Applies fail while this file exists. */
 export const failApply = Bun.file(join(work, "fail-apply"));
 
@@ -30,7 +32,10 @@ const healthy = () => fetch(`${url}/healthz`).then((r) => r.ok, () => false);
 
 export const newDataDir = () => mkdtempSync(join(work, "data-"));
 
-/** Stops when it goes out of scope, if declared with `await using`. */
+/**
+ * Stops when it goes out of scope, if declared with `await using`. The flags win over the default ones, so use e.g.
+ * `--repo-config` if repos.yaml is not enough.
+ */
 export async function startAtlantis(env: Record<string, string>, flags: string[] = [], dataDir = newDataDir()) {
   if (await healthy()) throw new Error(`there is something running at ${url} already`);
   const { terraform_version } = await $`terraform version -json`.json();
@@ -72,6 +77,7 @@ export async function startAtlantis(env: Record<string, string>, flags: string[]
   }
 
   return {
+    run,
     plan: (pr: PullRequest) => run(pr, "atlantis plan"),
     apply: (pr: PullRequest, project?: string) => run(pr, `atlantis apply${project ? ` -p ${project}` : ""}`),
     [Symbol.asyncDispose]: stop,

@@ -1,13 +1,12 @@
 import { afterAll, beforeAll, expect, setDefaultTimeout, test } from "bun:test";
-import { failApply, waitFor } from "./atlantis";
-import { openPR, setup, start, teardown } from "./bitbucket-server";
+import { applied, failApply, waitFor } from "../atlantis";
+import { openPR, setup, start, teardown } from "./client";
 
 setDefaultTimeout(5 * 60_000);
 
 beforeAll(setup);
 afterAll(teardown);
 
-const applied = "Apply complete!";
 const builds = "Not all required builds are successful yet";
 const rejected = (reason: string) => `Pull request must be mergeable before running apply (${reason}).`;
 
@@ -22,6 +21,13 @@ test("plans when opened", async () => {
   await using atlantis = await start();
   const pr = await openPR({ events: ["pr:opened"] });
   await waitFor("the plan", async () => (await pr.comments()).some((c) => c.text.includes("Ran Plan for")));
+});
+
+test("draft", async () => {
+  await using atlantis = await start();
+  const pr = await openPR({ draft: true });
+  await atlantis.plan(pr);
+  expect(await atlantis.apply(pr)).toContain(rejected("Is a draft"));
 });
 
 test("conflict", async () => {
@@ -108,13 +114,4 @@ test("not enforced", async () => {
   await pr.review("NEEDS_WORK");
   await pr.build("ci", "FAILED");
   expect(await atlantis.apply(pr)).toContain(applied);
-});
-
-// Bitbucket says that drafts can be merged, and then refuses to merge them. So
-// this is expected to fail.
-test.failing("draft", async () => {
-  await using atlantis = await start();
-  const pr = await openPR({ draft: true });
-  await atlantis.plan(pr);
-  expect(await atlantis.apply(pr)).not.toContain(applied);
 });

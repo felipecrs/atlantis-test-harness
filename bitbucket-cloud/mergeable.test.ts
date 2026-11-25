@@ -1,37 +1,23 @@
 import { afterAll, beforeAll, expect, setDefaultTimeout, test } from "bun:test";
-import { failApply, newDataDir, waitFor } from "./atlantis";
-import { api, changeBase, createWebhook, openPR, repo, requireBuilds, restrict, setup, start, teardown } from "./bitbucket";
-import { openTunnel } from "./tunnel";
+import { applied, failApply, newDataDir } from "../atlantis";
+import {
+  api, blockedBy, changeBase, enforceMergeChecks, openPR, repo, requireBuilds, restrict, setup, start, teardown,
+  withSecondAccount,
+} from "./client";
 
 setDefaultTimeout(5 * 60_000);
 
+let builds: Awaited<ReturnType<typeof restrict>>;
 let enforced: Awaited<ReturnType<typeof restrict>>;
 
 beforeAll(async () => {
   await setup();
-  enforced = await restrict("enforce_merge_checks");
+  await restrict("require_no_changes_requested");
+  await restrict("require_tasks_to_be_completed");
+  builds = await requireBuilds(1);
+  enforced = await enforceMergeChecks();
 });
 afterAll(teardown);
-
-const applied = "Apply complete!";
-const blockedBy = (reason: string) => `Blocked by ${reason})`;
-const mergeQueue = process.env.BB_MERGE_QUEUE;
-const withMergeQueue = test.skipIf(!mergeQueue);
-const withSecondAccount = test.skipIf(!process.env.BB2_TOKEN);
-
-/** Otherwise they would conflict, and Bitbucket would remove them from the queue. */
-const emptyMergeQueue = () =>
-  waitFor("the merge queue to be empty", async () => {
-    await Bun.sleep(5000);
-    const { values } = await api("GET", `${repo}/merge-queues`);
-    return values.find((q: any) => q.target_branch.name === mergeQueue).queue_size === 0;
-  });
-
-const merged = (pr: Awaited<ReturnType<typeof openPR>>) =>
-  waitFor("the merge", async () => {
-    await Bun.sleep(5000);
-    return (await pr.state()) === "MERGED";
-  });
 
 /** Requests changes, which should block the apply until they are cleared. */
 async function changesRequested(flags: string[] = [], options?: Parameters<typeof start>[1]) {
@@ -158,8 +144,8 @@ test("other build", async () => {
 
 test("missing build", async () => {
   await using stack = new AsyncDisposableStack();
-  stack.defer(() => requireBuilds(1));
-  await requireBuilds(3); // two are from the plan
+  stack.defer(() => builds.change(1));
+  await builds.change(3); // two are from the plan
   await using atlantis = await start();
   const pr = await openPR(["p1"]);
   await atlantis.plan(pr);
@@ -194,47 +180,6 @@ test("failed apply", async () => {
   await failApply.delete();
   await atlantis.plan(pr);
   expect(await atlantis.apply(pr)).toContain(applied);
-});
-
-withSecondAccount("real webhooks", async () => {
-  await using tunnel = await openTunnel();
-  await using webhook = await createWebhook(tunnel.url);
-  await using atlantis = await start();
-  const pr = await openPR(["p1"]);
-  const replied = (what: string, text: string) =>
-    waitFor(what, async () => {
-      await Bun.sleep(2000);
-      return (await pr.comments()).some((c) => c.text.includes(text));
-    });
-  await replied("the plan", "Ran Plan for");
-  await pr.requestChanges();
-  await pr.comment("atlantis apply", "second");
-  await replied("the rejection", blockedBy("no_changes_requested"));
-  await pr.clearChanges();
-  await pr.comment("atlantis apply", "second");
-  await replied("the apply", applied);
-});
-
-withMergeQueue("merge queue, with automerge", async () => {
-  await using atlantis = await start(["--automerge"]);
-  await emptyMergeQueue();
-  const pr = await openPR(["p1"], { destination: mergeQueue });
-  await atlantis.plan(pr);
-  const reply = await atlantis.apply(pr);
-  expect(reply).toContain(applied);
-  expect(reply).not.toContain("Automerging failed");
-  expect(await pr.state()).not.toBe("MERGED"); // it's only queued
-  await merged(pr);
-});
-
-withMergeQueue("already in the merge queue", async () => {
-  await using atlantis = await start();
-  await emptyMergeQueue();
-  const pr = await openPR(["p1"], { destination: mergeQueue });
-  await atlantis.plan(pr);
-  await api("POST", `${pr.path}/merge`);
-  expect(await atlantis.apply(pr)).toContain(blockedBy("pullrequest_state_check"));
-  await merged(pr);
 });
 
 // The last one, since it changes the restrictions.

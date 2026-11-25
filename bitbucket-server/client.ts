@@ -1,9 +1,9 @@
 // Bitbucket Server, also known as Data Center. It runs in a container, and every
 // pull request gets its own repository.
 import { GenericContainer, Wait, type StartedTestContainer } from "testcontainers";
-import { secret, startAtlantis, url as atlantisUrl, type PullRequest } from "./atlantis";
+import { secret, startAtlantis, url as atlantisUrl, type PullRequest } from "../atlantis";
 
-const image = process.env.BBS_IMAGE ?? "atlassian/bitbucket:10.2";
+const image = process.env.BITBUCKET_SERVER_IMAGE ?? "atlassian/bitbucket:10.2";
 // Expires 3 hours after Bitbucket starts. It's the one Atlassian publishes for testing:
 // https://developer.atlassian.com/platform/marketplace/timebomb-licenses-for-testing-server-apps/
 const license = "AAABrQ0ODAoPeNp9kVFvmzAQx9/9KSztLZIJZIu0RkJqA6yNViAK0G3d+uDApXgjNrKPbPn2dYG0a6fuwS8+393v//O7vAMa8yN1PerOFrPZYn5GL+OczlzvI0m6/RZ0uisMaON7LgmURF5iwvfgVy3XWpj6nGPDjRFcOqXaE4Pc1M61KEEayI8t9I+DNI6jTbC6uP73wd/FdafLmhsIOYL/yMDcOXM98p95Yyn60wp97PvW769OpFHMRfMWagb6AHoV+svLs5x9LW4+sM+3t1ds6XpfRkw7jwcgEbSPugOSdVtTatGiUHK4mUwmSZqzT+mGrTdpWAT5Kk1YkUW24AcaLFBFt0eKNdARlUayVBVo2mr1E0qk32vE9sdiOr1XzgvEaTN0MBg67hwaKioV0koY1GLbIdjJwlBUtOwMqr39KYfY1JZZclm+9jLEsmbEAZ4CBJvoIo9Ctvz2CP2GrRHe6irkL6l+S5JFiW8Pm7suSfU9l8LwXkwIB2hUaxPmYPAUm/Q2bP315w5MGXL95DmEZ839jFEE3SlNedvS6rTCkOjAm25YvOON3fMAVTj4nTAtAhRH4o+fI5MQ7xSh2mtA1bPJrq0WAgIVAIGperR8m2N0fl/GfUUJfQnd+T1aX02kk";
@@ -18,7 +18,11 @@ async function api(method: string, path: string, body?: object, as: User = "admi
   const response = await fetch(`${url}/rest/${path}`, {
     method,
     // The passwords are the same as the names.
-    headers: { Authorization: `Basic ${btoa(`${as}:${as}`)}`, ...(body && !form && { "Content-Type": "application/json" }) },
+    headers: {
+      Authorization: `Basic ${btoa(`${as}:${as}`)}`,
+      "X-Atlassian-Token": "no-check", // needed by old versions
+      ...(body && !form && { "Content-Type": "application/json" }),
+    },
     body: form ? body : body && JSON.stringify(body),
   });
   const text = await response.text();
@@ -81,7 +85,7 @@ export async function openPR({ settings = {}, draft = false, events = ["pr:comme
     url: `http://host.docker.internal:${new URL(atlantisUrl).port}/events`,
   });
 
-  const terraform = await Bun.file(`${import.meta.dir}/terraform/main.tf`).text();
+  const terraform = await Bun.file(`${import.meta.dir}/../terraform/main.tf`).text();
   async function commit(branch: string, file: string, content: string, options: Record<string, string> = {}) {
     const form = new FormData();
     for (const [key, value] of Object.entries({ branch, content, message: "Change", ...options })) form.append(key, value);
@@ -90,7 +94,7 @@ export async function openPR({ settings = {}, draft = false, events = ["pr:comme
   const change = (branch: string, sourceCommitId: string, options = {}) =>
     commit(branch, "p1/main.tf", terraform.replace("base", crypto.randomUUID()), { sourceCommitId, ...options });
 
-  await commit("main", "atlantis.yaml", await Bun.file(`${import.meta.dir}/terraform/atlantis.yaml`).text());
+  await commit("main", "atlantis.yaml", await Bun.file(`${import.meta.dir}/../terraform/atlantis.yaml`).text());
   await commit("main", "p2/main.tf", terraform);
   const base = await commit("main", "p1/main.tf", terraform);
   const head = await change("change", base, { sourceBranch: "main" });

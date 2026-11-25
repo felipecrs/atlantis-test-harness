@@ -1,18 +1,26 @@
 // Bitbucket Cloud. Everything is done against its own base branch, so that it
 // doesn't touch the main one nor its restrictions.
-import { secret, startAtlantis, url, type PullRequest } from "./atlantis";
+import { test } from "bun:test";
+import { secret, startAtlantis, url, type PullRequest } from "../atlantis";
 
-const { BB_REPO, BB_EMAIL, BB_TOKEN, BB_ADMIN_TOKEN, BB2_EMAIL, BB2_TOKEN } = process.env;
+const env = (name: string) => process.env[`BITBUCKET_CLOUD_${name}`];
 const accounts = {
-  main: [BB_EMAIL, BB_TOKEN],
-  admin: [BB_EMAIL, BB_ADMIN_TOKEN],
-  second: [BB2_EMAIL, BB2_TOKEN],
+  main: [env("EMAIL"), env("TOKEN")],
+  admin: [env("EMAIL"), env("ADMIN_TOKEN")],
+  second: [env("SECOND_EMAIL"), env("SECOND_TOKEN")],
 };
 type Account = keyof typeof accounts;
 
 const prefix = "harness-";
 const base = `${prefix}${Date.now()}`;
-export const repo = `repositories/${BB_REPO}`;
+export const repo = `repositories/${env("REPO")}`;
+
+/** For the tests that need more than the main account. */
+export const withSecondAccount = test.skipIf(!env("SECOND_TOKEN"));
+export const mergeQueue = env("MERGE_QUEUE");
+export const withMergeQueue = test.skipIf(!mergeQueue);
+
+export const blockedBy = (reason: string) => `Blocked by ${reason})`;
 
 export async function api(method: string, path: string, body?: object, as: Account = "main"): Promise<any> {
   const form = body instanceof FormData;
@@ -37,7 +45,7 @@ export function start(flags: string[] = [], { as = "main" as Account, dataDir = 
       ATLANTIS_BITBUCKET_API_USER: email!,
       ATLANTIS_BITBUCKET_TOKEN: token!,
       ATLANTIS_BITBUCKET_WEBHOOK_SECRET: secret,
-      ATLANTIS_REPO_ALLOWLIST: `bitbucket.org/${BB_REPO}`,
+      ATLANTIS_REPO_ALLOWLIST: `bitbucket.org/${env("REPO")}`,
     },
     flags,
     dataDir,
@@ -54,7 +62,7 @@ async function commit(branch: string, files: Record<string, string>, parent: str
 
 /** Files for a change in the given projects. */
 async function change(projects: string[]) {
-  const main = await Bun.file(`${import.meta.dir}/terraform/main.tf`).text();
+  const main = await Bun.file(`${import.meta.dir}/../terraform/main.tf`).text();
   return Object.fromEntries(projects.map((p) => [`${p}/main.tf`, main.replace("base", crypto.randomUUID())]));
 }
 
@@ -64,28 +72,24 @@ export async function changeBase(project: string) {
 }
 
 export async function restrict(kind: string, value?: number) {
-  const body = { kind, value, branch_match_kind: "glob", pattern: base, users: [], groups: [] };
-  const { id } = await api("POST", `${repo}/branch-restrictions`, body, "admin");
-  return { [Symbol.asyncDispose]: () => api("DELETE", `${repo}/branch-restrictions/${id}`, undefined, "admin") };
+  const body = { kind, branch_match_kind: "glob", pattern: base, users: [], groups: [] };
+  const { id } = await api("POST", `${repo}/branch-restrictions`, { ...body, value }, "admin");
+  const path = `${repo}/branch-restrictions/${id}`;
+  return {
+    change: (value: number) => api("PUT", path, { ...body, value }, "admin"),
+    [Symbol.asyncDispose]: () => api("DELETE", path, undefined, "admin"),
+  };
 }
 
+export const requireBuilds = (minimum: number) => restrict("require_passing_builds_to_merge", minimum);
+/** Otherwise, Bitbucket Cloud allows merging even if merge checks fail. */
+export const enforceMergeChecks = () => restrict("enforce_merge_checks");
+
+/** Creates the base branch, without restrictions. */
 export async function setup() {
   const { mainbranch } = await api("GET", repo);
-  const yaml = await Bun.file(`${import.meta.dir}/terraform/atlantis.yaml`).text();
+  const yaml = await Bun.file(`${import.meta.dir}/../terraform/atlantis.yaml`).text();
   await commit(base, { "atlantis.yaml": yaml, ...(await change(["p1", "p2"])) }, await head(mainbranch.name));
-  await restrict("require_no_changes_requested");
-  await restrict("require_tasks_to_be_completed");
-  await requireBuilds(1);
-}
-
-/** There can be only one per branch, so it needs to be set back to 1. */
-let buildsRestriction: number | undefined;
-export async function requireBuilds(value: number) {
-  const body = { kind: "require_passing_builds_to_merge", value, branch_match_kind: "glob", pattern: base, users: [], groups: [] };
-  const path = `${repo}/branch-restrictions`;
-  ({ id: buildsRestriction } = buildsRestriction
-    ? await api("PUT", `${path}/${buildsRestriction}`, body, "admin")
-    : await api("POST", path, body, "admin"));
 }
 
 /** Delivers the events for real. */
@@ -135,7 +139,7 @@ export async function openPR(projects: string[], { draft = false, destination = 
       await api("POST", `${repo}/pullrequests/${id}/merge`, { close_source_branch: false, message: "Merge [skip ci]" });
       await Bun.sleep(5000);
     },
-    build: (key: string, state: "FAILED" | "INPROGRESS" | "SUCCESSFUL") =>
+    build: (key: string, state: "FAILED" | "INPROGRESS" | "STOPPED" | "SUCCESSFUL") =>
       api("POST", `${repo}/commit/${source.commit.hash}/statuses/build`, { key, state, url: "https://example.com" }),
     async comments() {
       const { values } = await api("GET", `${path}/comments?pagelen=100`);
